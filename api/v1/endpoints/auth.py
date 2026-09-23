@@ -18,6 +18,7 @@ from src.auth import (
     check_rate_limit,
     clear_rate_limit,
     create_session,
+    generate_csrf_token,
     get_client_ip,
     has_stored_password,
     is_auth_enabled,
@@ -347,8 +348,10 @@ async def auth_update_settings(request: Request, body: AuthSettingsRequest):
             )
         # We manually set loggedIn=True because the cookie is being set in this response
         # and won't be visible in request.cookies until the NEXT request.
+        csrf_token = generate_csrf_token(session_val)
         content = _get_auth_status_dict(request)
         content["loggedIn"] = True
+        content["csrf_token"] = csrf_token
         resp = JSONResponse(content=content)
         _set_session_cookie(resp, session_val, request)
         return resp
@@ -423,7 +426,8 @@ async def auth_login(request: Request, body: LoginRequest):
             content={"error": "internal_error", "message": "Failed to create session"},
         )
 
-    resp = JSONResponse(content={"ok": True})
+    csrf_token = generate_csrf_token(session_val)
+    resp = JSONResponse(content={"ok": True, "csrf_token": csrf_token})
     _set_session_cookie(resp, session_val, request)
     return resp
 

@@ -7,7 +7,8 @@ import { analysisApi, DuplicateTaskError } from '../api/analysis';
 import { historyApi } from '../api/history';
 import { agentApi, type SkillInfo } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
-import { ApiErrorAlert, Button, Drawer, EmptyState, InlineAlert } from '../components/common';
+import { pipelineApi } from '../api/pipeline';
+import { ApiErrorAlert, Button, Card, Drawer, EmptyState, InlineAlert } from '../components/common';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { StockHistoryTrendDrawer } from '../components/history';
@@ -256,6 +257,40 @@ const HomePage: React.FC = () => {
   const [marketReviewPayload, setMarketReviewPayload] = useState<MarketReviewPayload | null>(null);
   const [marketReviewRegionOverride, setMarketReviewRegionOverride] = useState<MarketReviewRegion[] | undefined>();
   const [analysisSkills, setAnalysisSkills] = useState<SkillInfo[]>([]);
+
+  const [pipelineRunId, setPipelineRunId] = useState<string | null>(null);
+  const [pipelineLog, setPipelineLog] = useState('');
+  const [pipelineStatus, setPipelineStatus] = useState<'idle' | 'running' | 'completed' | 'failed'>('idle');
+  const pipelinePollRef = useRef<number | null>(null);
+
+  const startPipeline = async () => {
+    try {
+      const { runId } = await pipelineApi.run();
+      setPipelineRunId(runId);
+      setPipelineStatus('running');
+      setPipelineLog('');
+    } catch (e) {
+      setPipelineLog(`启动失败: ${String(e)}`);
+    }
+  };
+
+  useEffect(() => {
+    if (pipelineStatus !== 'running' || !pipelineRunId) return;
+    pipelinePollRef.current = window.setInterval(async () => {
+      try {
+        const task = await pipelineApi.getTask(pipelineRunId);
+        setPipelineLog(task.log);
+        if (task.status !== 'running') {
+          setPipelineStatus(task.status);
+          setPipelineLog(task.log + (task.exitCode !== 0 ? `\n[exit ${task.exitCode}]` : '\n[完成]'));
+          if (pipelinePollRef.current) window.clearInterval(pipelinePollRef.current);
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 2000);
+    return () => { if (pipelinePollRef.current) window.clearInterval(pipelinePollRef.current); };
+  }, [pipelineStatus, pipelineRunId]);
   const [selectedStrategyId, setSelectedStrategyId] = useState('');
   const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
   const [runFlowDrawer, setRunFlowDrawer] = useState<RunFlowDrawerState>({ open: false });
@@ -1429,6 +1464,28 @@ const HomePage: React.FC = () => {
       className="flex h-[calc(100vh-5rem)] w-full flex-col overflow-hidden md:flex-row sm:h-[calc(100vh-5.5rem)] lg:h-[calc(100vh-2rem)]"
     >
       <div className="flex-1 flex flex-col min-h-0 min-w-0 max-w-full lg:max-w-6xl mx-auto w-full">
+        <Card title="完整流水线 (AlphaEvo → AlphaSift → DSA)" className="mt-4">
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              variant="home-action-ai"
+              size="md"
+              isLoading={pipelineStatus === 'running'}
+              loadingText="运行中..."
+              onClick={() => void startPipeline()}
+            >
+              运行完整流水线
+            </Button>
+            {pipelineStatus !== 'idle' && (
+              <span className="text-sm text-secondary-text">状态: {pipelineStatus}</span>
+            )}
+          </div>
+          {pipelineLog && (
+            <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-xs text-green-300">
+              {pipelineLog}
+            </pre>
+          )}
+        </Card>
         <header className="relative z-30 flex min-w-0 flex-shrink-0 items-center overflow-visible px-3 py-3 md:px-4 md:py-4">
           <div className="flex min-w-0 flex-1 flex-col gap-2.5 md:flex-row md:items-center">
             <div className="flex min-w-0 flex-1 items-center gap-2.5">

@@ -459,6 +459,22 @@ def overwrite_password(new_password: str) -> Optional[str]:
         return "密码保存失败"
 
 
+def generate_csrf_token(session_value: str) -> str:
+    """Derive a CSRF token from a signed session value using HMAC."""
+    secret = _get_session_secret()
+    if not secret or not session_value:
+        return ""
+    return hmac.new(secret, session_value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_csrf_token(session_value: str, csrf_token: str) -> bool:
+    """Verify a CSRF token matches the one derived from the session."""
+    if not session_value or not csrf_token:
+        return False
+    expected = generate_csrf_token(session_value)
+    return hmac.compare_digest(csrf_token, expected)
+
+
 def reset_password_cli() -> int:
     """Interactive CLI to reset password. Returns exit code."""
     _ensure_env_loaded()

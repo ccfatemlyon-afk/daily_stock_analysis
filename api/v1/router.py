@@ -23,6 +23,7 @@ from api.v1.endpoints import (
     history,
     intelligence,
     portfolio,
+    pipeline,
     stocks,
     system_config,
     usage,
@@ -113,4 +114,10 @@ router.include_router(
 router.include_router(
     health.router,
     tags=["Health"]
+)
+
+router.include_router(
+    pipeline.router,
+    prefix="/pipeline",
+    tags=["Pipeline"]
 )

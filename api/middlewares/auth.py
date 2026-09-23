@@ -12,7 +12,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from src.auth import COOKIE_NAME, is_auth_enabled, verify_session
+from src.auth import COOKIE_NAME, is_auth_enabled, verify_session, verify_csrf_token
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     "message": "Login required",
                 },
             )
+
+        # CSRF defense-in-depth: the session cookie is SameSite=Lax + HttpOnly,
+        # which already blocks cross-site CSRF at the browser level. We therefore
+        # do NOT require an X-CSRF-Token (the SPA client does not send one). We
+        # only reject a request when a token IS provided but is invalid. This keeps
+        # same-origin SPA writes working while still validating tokens if present.
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            csrf_header = request.headers.get("x-csrf-token", "")
+            if csrf_header and not verify_csrf_token(cookie_val, csrf_header):
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "csrf_rejected",
+                        "message": "Invalid CSRF token",
+                    },
+                )
 
         return await call_next(request)
 
