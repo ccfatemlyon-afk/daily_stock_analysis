@@ -29,7 +29,12 @@
 7. TencentFetcher (Priority 5) - 腾讯直连日 K 最终兜底
 8. LongbridgeFetcher (Priority 5) - 长桥 OpenAPI（美股/港股兜底，与 Tencent 市场不重叠）
 
+【额外数据源（需配置 API Key）】
+9. XTickFetcher - XTick API（需配置 XTICK_TOKEN，A股/港股/ETF）
+10. HiThinkFetcher - 同花顺 Financial-API（需配置 HITHINK_FINANCE_API_KEY）
+
 提示：优先级数字越小越优先，同优先级按初始化顺序排列
+额外数据源默认优先级=6，配置 API Key 后自动提升到 Priority 1
 """
 
 from .base import BaseFetcher, DataFetcherManager
@@ -43,6 +48,9 @@ from .yfinance_fetcher import YfinanceFetcher
 from .longbridge_fetcher import LongbridgeFetcher
 from .finnhub_fetcher import FinnhubFetcher
 from .alphavantage_fetcher import AlphaVantageFetcher
+from .xtick_fetcher import XTickFetcher
+from .hithink_fetcher import HiThinkFetcher
+from .fred_fetcher import FredFetcher
 from .us_index_mapping import is_us_index_code, is_us_stock_code, get_us_index_yf_symbol, US_INDEX_MAPPING
 
 __all__ = [
@@ -58,6 +66,9 @@ __all__ = [
     'LongbridgeFetcher',
     'FinnhubFetcher',
     'AlphaVantageFetcher',
+    'XTickFetcher',
+    'HiThinkFetcher',
+    'FredFetcher',
     'is_us_index_code',
     'is_us_stock_code',
     'is_hk_stock_code',

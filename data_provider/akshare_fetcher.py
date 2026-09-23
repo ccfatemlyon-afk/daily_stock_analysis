@@ -49,6 +49,7 @@ from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,
 from .realtime_types import (
     UnifiedRealtimeQuote, ChipDistribution, RealtimeSource,
     get_realtime_circuit_breaker, get_chip_circuit_breaker,
+    CircuitBreaker,
     safe_float, safe_int  # 使用统一的类型转换函数
 )
 from .us_index_mapping import is_us_index_code, is_us_stock_code
@@ -62,9 +63,110 @@ logger = logging.getLogger(__name__)
 
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
-_AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取「正浮点数」环境变量；非法/非正值回退默认并告警。
+
+    沿用 `efinance_fetcher._EF_CALL_TIMEOUT` 的做法：配置写错不该让进程起不来。
+    """
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (ValueError, TypeError):
+        logger.warning(f"{name} 不是合法数字（{raw!r}），回退默认 {default:g}")
+        return default
+    if value <= 0:
+        logger.warning(f"{name} 必须为正数（{raw!r}），回退默认 {default:g}")
+        return default
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取「正整数」环境变量；非法/非正值回退默认并告警。"""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (ValueError, TypeError):
+        logger.warning(f"{name} 不是合法整数（{raw!r}），回退默认 {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"{name} 必须为正整数（{raw!r}），回退默认 {default}")
+        return default
+    return value
+
+
+# 历史 K 线「单渠道」调用的等待上限（秒）。
+#
+# 每个渠道调用都跑在独立子进程里（见 `_akshare_call_with_timeout`），超时即放弃、
+# 换下一个渠道。2026-09-14 实测：新浪财经要 ~26s 才返回，而 30s 上限过于贴边 ——
+# 同一只票 600941 被判超时，000333 却在 26s 成功。即 30s 会把「慢但可用」的渠道
+# 误判成不可用，白走一次腾讯（~37s）。网络慢时调高即可。
+# 默认 30.0 → 与历史行为逐字节一致（零回归）。
+_AKSHARE_HISTORY_CALL_TIMEOUT = _env_float("AKSHARE_HISTORY_TIMEOUT_SEC", 30.0)
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
+
+# A 股历史 K 线的渠道顺序，默认 东财 → 新浪 → 腾讯（与历史行为一致）。
+# 已知某渠道长期不可用时可重排，例如 `AKSHARE_HISTORY_CHANNELS=tx,sina,em`。
+# 无法识别的名字会被丢弃；若全被丢弃则回退默认顺序（不会因为写错而没渠道可用）。
+_HISTORY_CHANNELS: Tuple[Tuple[str, str], ...] = (
+    ("em", "东方财富"),
+    ("sina", "新浪财经"),
+    ("tx", "腾讯财经"),
+)
+
+
+def _history_channel_order() -> Tuple[Tuple[str, str], ...]:
+    """解析 `AKSHARE_HISTORY_CHANNELS`，返回 [(渠道键, 展示名)]。"""
+    raw = (os.getenv("AKSHARE_HISTORY_CHANNELS") or "").strip()
+    if not raw:
+        return _HISTORY_CHANNELS
+    known = dict(_HISTORY_CHANNELS)
+    picked: List[Tuple[str, str]] = []
+    for token in raw.split(","):
+        key = token.strip().lower()
+        if not key:
+            continue
+        if key not in known:
+            logger.warning(f"AKSHARE_HISTORY_CHANNELS 含未知渠道 {key!r}，已忽略")
+            continue
+        if any(existing == key for existing, _ in picked):
+            continue
+        picked.append((key, known[key]))
+    if not picked:
+        logger.warning("AKSHARE_HISTORY_CHANNELS 未包含任何有效渠道，回退默认顺序")
+        return _HISTORY_CHANNELS
+    return tuple(picked)
+
+
+# 历史渠道级熔断。
+#
+# 09-14 的 run：东财渠道每次都失败（RemoteDisconnected），但 akshare **只在 fetcher
+# 级**有熔断（`EfinanceFetcher` 连续 3 次失败 → 冷却 300s），**渠道级没有** ——
+# 于是每只股票都要把三个渠道重新探一遍，7 只票光 akshare 就烧掉约 570s。
+# 这里给历史渠道补上同类熔断：某渠道连续失败到阈值就冷却，冷却后自动半开探测。
+# 默认开启（与 realtime / chip 熔断器同一策略）；`AKSHARE_HISTORY_BREAKER=0` 可关闭。
+_HISTORY_BREAKER_ENABLED = (os.getenv("AKSHARE_HISTORY_BREAKER") or "1").strip() != "0"
+
+_history_channel_breaker: Optional[CircuitBreaker] = (
+    CircuitBreaker(
+        failure_threshold=_env_int("AKSHARE_HISTORY_BREAKER_THRESHOLD", 3),
+        cooldown_seconds=_env_float("AKSHARE_HISTORY_BREAKER_COOLDOWN_SEC", 300.0),
+        half_open_max_calls=1,
+    )
+    if _HISTORY_BREAKER_ENABLED
+    else None
+)
+
+
+def get_history_channel_breaker() -> Optional[CircuitBreaker]:
+    """历史 K 线渠道级熔断器；`AKSHARE_HISTORY_BREAKER=0` 时返回 None（等价于关闭）。"""
+    return _history_channel_breaker
 
 
 # User-Agent 池，用于随机轮换
@@ -415,9 +517,27 @@ class AkshareFetcher(BaseFetcher):
         self.sleep_max = sleep_max
         self._last_request_time: Optional[float] = None
         self._history_call_timeout = _AKSHARE_HISTORY_CALL_TIMEOUT
+        # 代理轮转配置（解决 RemoteDisconnected 问题）
+        self._proxies = self._load_proxies()
+        self._proxy_index = 0
         # 东财补丁开启才执行打补丁操作
         if get_config().enable_eastmoney_patch:
             eastmoney_patch()
+    
+    def _load_proxies(self) -> list:
+        """从环境变量加载代理列表，格式: PROXY_LIST=http://ip:port,http://ip:port"""
+        raw = os.getenv("AKSHARE_PROXY_LIST", "")
+        if not raw:
+            return []
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    
+    def _get_proxy(self) -> Optional[dict]:
+        """轮转获取代理配置"""
+        if not self._proxies:
+            return None
+        proxy = self._proxies[self._proxy_index % len(self._proxies)]
+        self._proxy_index += 1
+        return {"http": proxy, "https": proxy}
     
     def _set_random_user_agent(self) -> None:
         """
@@ -459,7 +579,7 @@ class AkshareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, ConnectionResetError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -497,34 +617,63 @@ class AkshareFetcher(BaseFetcher):
         """
         获取普通 A 股历史数据
 
-        策略：
+        策略（顺序可用 `AKSHARE_HISTORY_CHANNELS` 重排，默认与历史行为一致）：
         1. 优先尝试东方财富接口 (ak.stock_zh_a_hist)
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
+
+        每个渠道受**渠道级熔断**约束（见 `_history_channel_breaker`）：连续失败到
+        阈值后冷却，冷却期内直接跳过，避免对已经死掉的渠道反复空等。
         """
-        # 尝试列表
-        methods = [
-            (self._fetch_stock_data_em, "东方财富"),
-            (self._fetch_stock_data_sina, "新浪财经"),
-            (self._fetch_stock_data_tx, "腾讯财经"),
-        ]
+        # 渠道键 → 取数方法（展示名统一来自 `_HISTORY_CHANNELS`，避免两处维护）
+        methods = {
+            "em": self._fetch_stock_data_em,
+            "sina": self._fetch_stock_data_sina,
+            "tx": self._fetch_stock_data_tx,
+        }
+        ordered: List[Tuple[str, Any, str]] = []
+        for channel_key, source_name in _history_channel_order():
+            fetch_method = methods.get(channel_key)
+            if fetch_method is None:  # 兜底：表里有、方法没实现
+                logger.warning(f"历史渠道 {channel_key!r} 无对应实现，已跳过")
+                continue
+            ordered.append((channel_key, fetch_method, source_name))
 
-        last_error = None
+        breaker = _history_channel_breaker
+        last_error: Optional[Exception] = None
+        skipped: List[str] = []
 
-        for fetch_method, source_name in methods:
+        for channel_key, fetch_method, source_name in ordered:
+            if breaker is not None and not breaker.is_available(channel_key):
+                logger.info(f"[数据源] 跳过 {source_name}（熔断冷却中）: {stock_code}")
+                skipped.append(source_name)
+                continue
+
             try:
                 logger.info(f"[数据源] 尝试使用 {source_name} 获取 {stock_code}...")
                 df = fetch_method(stock_code, start_date, end_date)
 
                 if df is not None and not df.empty:
                     logger.info(f"[数据源] {source_name} 获取成功")
+                    if breaker is not None:
+                        breaker.record_success(channel_key)
                     return df
+
+                # 空结果不算渠道故障，但半开探测应退回熔断而不是白占名额
+                if breaker is not None:
+                    breaker.record_inconclusive(channel_key)
             except Exception as e:
                 last_error = e
                 logger.warning(f"[数据源] {source_name} 获取失败: {e}")
+                if breaker is not None:
+                    breaker.record_failure(channel_key, str(e))
                 # 继续尝试下一个
 
-        # 所有都失败
+        # 所有渠道都失败（或全部处于熔断冷却中）
+        if last_error is None and skipped:
+            raise DataFetchError(
+                f"Akshare 所有渠道均处于熔断冷却中，本次跳过: {', '.join(skipped)}"
+            )
         raise DataFetchError(f"Akshare 所有渠道获取失败: {last_error}")
 
     def _fetch_stock_data_em(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:

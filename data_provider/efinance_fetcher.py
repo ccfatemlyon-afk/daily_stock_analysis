@@ -51,6 +51,25 @@ except (ValueError, TypeError):
     )
     _EF_CALL_TIMEOUT = 30
 
+# A 股 / ETF **历史日线**调用的线程等待上限（秒）。
+#
+# 与上面那个键的区别很重要：历史日线的两个调用点显式传 `timeout=60`
+# （见 `_ef_call_with_timeout(... timeout=60)`），而 `_ef_call_with_timeout` 的
+# `timeout` 形参是**线程等待上限**、不会透传给 efinance。因此
+# `EFINANCE_CALL_TIMEOUT` 对历史日线**不生效** —— 这是很容易踩的坑。
+#
+# 2026-09-14 实测：efinance 是整条数据源链里最贵的一环（600941 耗时 63.69s，
+# ≈ 60s 等待 + 开销），而它恰好是优先级 P0 的源，每只票都要先等它一次。
+# 网络差时可调低以更快落到 akshare/baostock。默认 60 → 与历史行为一致。
+try:
+    _EF_HISTORY_CALL_TIMEOUT = int(os.environ.get("EFINANCE_HISTORY_TIMEOUT_SEC", "60"))
+except (ValueError, TypeError):
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "EFINANCE_HISTORY_TIMEOUT_SEC is not a valid integer, using default 60s"
+    )
+    _EF_HISTORY_CALL_TIMEOUT = 60
+
 from src.patches.eastmoney_patch import eastmoney_patch
 from src.config import get_config
 from .base import (
@@ -431,7 +450,7 @@ class EfinanceFetcher(BaseFetcher):
                 end=end_date_fmt,
                 klt=101,  # 日线
                 fqt=1,    # 前复权
-                timeout=60,
+                timeout=_EF_HISTORY_CALL_TIMEOUT,
             )
             
             api_elapsed = time.time() - api_start
@@ -525,7 +544,7 @@ class EfinanceFetcher(BaseFetcher):
                 fqt=1,    # forward-adjusted
                 quote_id_mode=True,
                 use_id_cache=False,
-                timeout=60,
+                timeout=_EF_HISTORY_CALL_TIMEOUT,
             )
 
             api_elapsed = time.time() - api_start
