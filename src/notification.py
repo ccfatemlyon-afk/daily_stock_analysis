@@ -17,6 +17,8 @@ A股自选股智能分析系统 - 通知层
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,6 +27,7 @@ from enum import Enum
 
 from src.config import Config, get_config
 from src.enums import ReportType
+from data_provider.base import normalize_stock_code
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.notification_routing import (
     get_notification_route_config,
@@ -109,6 +112,44 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+SUMMARY_ANCHOR_ID = "summary"
+
+
+def _stock_anchor_id(code: str) -> str:
+    """个股详情在**本封邮件内**的锚点 id（用于"分析结果摘要"目录跳转）。
+
+    背景（2026-09-15）：用户希望在摘要里点某只股票时，直接跳到**同一封邮件内**
+    该股票的详细分析段落（邮件主题内容部分），而不是跳到站外行情页。
+
+    实现依据：报告先由 markdown2 转 HTML（extras 不含 header-ids，但 markdown2
+    原样透传内联 HTML），因此
+      - 详情标题写成 `## <a id="stock-000333" name="stock-000333"></a>...`
+      - 摘要链接写成 `[美的集团(000333)](#stock-000333)` → `<a href="#stock-000333">`
+    两者共用同一个 id，即可在支持页内锚点的客户端里实现"摘要 → 详情"跳转。
+
+    ⚠️ 已知限制（2026-09-15 实测 + 查证）：**Gmail 会破坏页内锚点**。
+    Gmail 为做 CSS 沙箱隔离，会把邮件里所有
+      - `id="xxx"`  重写为 `id="m_<hash>xxx"`（**无**下划线分隔）
+      - `href="#xxx"` 重写为 `href="#m_<hash>_xxx"`（**有**下划线分隔）
+    哈希相同但连接符不同 → 永远匹配不上 → 锚点全部失效。原始 HTML（「显示原始邮件」）
+    完全正常，因此**不是发送端的问题**，发送端无法修复。
+    这就是为什么这里**同时输出 `name` 属性** —— 部分客户端（Apple Mail、Thunderbird 等）
+    认 `name` 且不重写 `href`，对它们仍可正常跳转。
+    """
+    return f"stock-{normalize_stock_code(str(code))}"
+
+
+def _anchor_tag(anchor_id: str) -> str:
+    """生成页内锚点标签：同时输出 `id` 与 `name`。
+
+    `id` 是现代标准写法；`name` 是 HTML4 遗留写法，但邮件客户端支持面更广
+    （部分客户端只认 `name`）。两者同时给出是邮件开发的通用兼容做法。
+    详见 `_stock_anchor_id` 的「已知限制」段落。
+    """
+    return f'<a id="{anchor_id}" name="{anchor_id}"></a>'
+
 
 
 def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str:
@@ -1303,27 +1344,83 @@ class NotificationService(
         ]
         self._append_market_status_line(report_lines, results, report_language)
 
-        # === 新增：分析结果摘要 (Issue #112) ===
+        # === 分析结果摘要 (Issue #112；2026-09-15：按 自选股/推荐股 分组 + 邮件内锚点跳转) ===
         if results:
-            report_lines.extend([
-                f"## 📊 {labels['summary_heading']}",
-                "",
-            ])
-            for r in sorted_results:
+            watchlist_env = os.environ.get("WATCHLIST_CODES", "").strip()
+            rec_env = os.environ.get("RECOMMENDED_CODES", "").strip()
+            wl_set = (
+                {normalize_stock_code(c) for c in watchlist_env.split(",") if c.strip()}
+                if watchlist_env else set()
+            )
+            rec_set = (
+                {normalize_stock_code(c) for c in rec_env.split(",") if c.strip()}
+                if rec_env else set()
+            )
+
+            def _summary_entry(r) -> str:
                 signal_text, signal_emoji, _ = self._get_signal_level(r)
                 display_name = self._get_display_name(r, report_language)
-                report_lines.append(
-                    f"{signal_emoji} **{display_name}({r.code})**: "
+                code_n = normalize_stock_code(r.code)
+                # 个股链接指向**本封邮件内**的详情锚点（#stock-<code>），
+                # 保留原有加粗视觉权重；summary_only 模式下没有详情段落，
+                # 锚点会变成死链，故退化为纯文本。
+                # T3 裁决（2026-09-20，方案①）：Gmail/Outlook 下锚点跳转无解，
+                # 故摘要条目直接内联一句话核心结论 —— 不点跳转也能看到详情。
+                if self._report_summary_only:
+                    name_text = f"**{display_name}({r.code})**"
+                else:
+                    name_text = f"[**{display_name}({r.code})**](#{_stock_anchor_id(r.code)})"
+                star = " ⭐推荐" if (code_n in wl_set and code_n in rec_set) else ""
+                dashboard = getattr(r, "dashboard", None) or {}
+                core = dashboard.get("core_conclusion", {}) if isinstance(dashboard, dict) else {}
+                one_sentence = (core.get("one_sentence") if isinstance(core, dict) else None) or getattr(
+                    r, "analysis_summary", "")
+                detail = f" | 💡 {one_sentence}" if one_sentence else ""
+                return (
+                    f"{signal_emoji} {name_text}{star}: "
                     f"{signal_text} | "
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
+                    f"{detail}"
                 )
-                if self._report_summary_only:
-                    news_disclosure = self._empty_news_disclosure(r, report_language)
-                    if news_disclosure:
-                        report_lines.append(news_disclosure)
+
+            def _append_summary_group(title: str, group: list) -> None:
+                if not group:
+                    return
+                report_lines.append(f"**{title}**")
+                report_lines.append("")
+                for r in group:
+                    report_lines.append(_summary_entry(r))
+                    if self._report_summary_only:
+                        news_disclosure = self._empty_news_disclosure(r, report_language)
+                        if news_disclosure:
+                            report_lines.append(news_disclosure)
+                report_lines.append("")
+
             report_lines.extend([
+                f'## {_anchor_tag(SUMMARY_ANCHOR_ID)}📊 {labels["summary_heading"]}',
                 "",
+            ])
+            # 有自选/推荐区分且多股时，分「自选股 / 推荐股」两组；否则维持原平铺
+            # （单股、或上游未注入 WATCHLIST_CODES 时）。
+            if wl_set and len(results) > 1:
+                _append_summary_group(
+                    "自选股",
+                    [r for r in sorted_results if normalize_stock_code(r.code) in wl_set],
+                )
+                _append_summary_group(
+                    "推荐股",
+                    [r for r in sorted_results if normalize_stock_code(r.code) not in wl_set],
+                )
+            else:
+                for r in sorted_results:
+                    report_lines.append(_summary_entry(r))
+                    if self._report_summary_only:
+                        news_disclosure = self._empty_news_disclosure(r, report_language)
+                        if news_disclosure:
+                            report_lines.append(news_disclosure)
+                report_lines.append("")
+            report_lines.extend([
                 "---",
                 "",
             ])
@@ -1338,9 +1435,18 @@ class NotificationService(
                 stock_name = self._get_display_name(result, report_language)
 
                 report_lines.extend([
-                    f"## {signal_emoji} {stock_name} ({result.code})",
+                    f'## {_anchor_tag(_stock_anchor_id(result.code))}{signal_emoji} {stock_name} ({result.code})',
                     "",
                 ])
+                # P1-1a 数据门醒目披露：缺失维度段首明示（无缺口时零输出）。
+                _gaps = getattr(result, 'data_gaps', None) or []
+                if _gaps:
+                    _gap_names = {'technical': '技术面', 'fundamentals': '基本面', 'news': '新闻面'}
+                    report_lines.extend([
+                        f"⚠️ **数据缺口**：{ '、'.join(_gap_names.get(str(g), str(g)) for g in _gaps) }缺失，"
+                        "相关结论未参与打分，详见各段“数据缺失，无法判断”。",
+                        "",
+                    ])
                 # ========== 舆情与基本面概览（放在最前面）==========
                 intel = dashboard.get('intelligence', {}) if dashboard else {}
                 if intel:
@@ -1588,6 +1694,8 @@ class NotificationService(
                         report_lines.append("")
 
                 report_lines.extend([
+                    f"[↑ {labels.get('summary_heading', '分析结果摘要')}](#{SUMMARY_ANCHOR_ID})",
+                    "",
                     "---",
                     "",
                 ])
@@ -1601,7 +1709,68 @@ class NotificationService(
         if models:
             report_lines.append(f"*{labels['analysis_model_label']}：{', '.join(models)}*")
 
-        return "\n".join(report_lines)
+        raw_text = "\n".join(report_lines)
+
+        # 自选股 / 每日推荐股 分段（由上游编排 AlphaSift 通过环境变量注入）
+        watchlist_env = os.environ.get("WATCHLIST_CODES", "").strip()
+        if len(results) > 1 and watchlist_env:
+            wl_set = {normalize_stock_code(c) for c in watchlist_env.split(",") if c.strip()}
+            rec_env = os.environ.get("RECOMMENDED_CODES", "").strip()
+            rec_set = (
+                {normalize_stock_code(c) for c in rec_env.split(",") if c.strip()}
+                if rec_env else set()
+            )
+            # 按股票标题拆分为独立的详细分析块
+            seg = re.split(r'(?m)^(##\s+.*?\([0-9A-Za-z.]+\)\s*)$', raw_text)
+            head = seg[0]
+            stock_blocks = []  # (code, header_line, body_without_footer)
+            footer = ""
+            for i in range(1, len(seg), 2):
+                header_line = seg[i]
+                body = seg[i + 1] if (i + 1) < len(seg) else ""
+                m = re.match(r'^##\s+.*?\(([0-9A-Za-z.]+)\)\s*$', header_line)
+                code = normalize_stock_code(m.group(1)) if m else ""
+                body_lines = body.split("\n")
+                # 只剥离尾部 footer 行（单星号包裹，如 *分析模型：...*），
+                # 正文加粗行（**...）必须保留：按首个 "*" 行切断会 shred 整块正文
+                end = len(body_lines)
+                while end > 0:
+                    s = body_lines[end - 1].strip()
+                    if not s or (s.startswith("*") and not s.startswith("**")):
+                        end -= 1
+                    else:
+                        break
+                stock_blocks.append((code, header_line, "\n".join(body_lines[:end]).strip("\n")))
+                footer = "\n".join(body_lines[end:]).strip("\n")
+            wl_blocks = [b for b in stock_blocks if b[0] in wl_set]
+            rec_blocks = [b for b in stock_blocks if b[0] not in wl_set]
+
+            out_parts = [head.rstrip(), "", "## 自选股分析", ""]
+            for code, header_line, block_body in wl_blocks:
+                out_parts.append(header_line)
+                out_parts.append(block_body)
+                if code in rec_set:
+                    out_parts.append("")
+                    out_parts.append("> ⭐ 该股票同时也是今日推荐股之一")
+                out_parts.append("")
+            reasons = os.environ.get("SELECTION_REASONING_MD", "").strip()
+            if reasons:
+                reasons = re.sub(r'^\s*#\s+.*\n', '', reasons, count=1).strip("\n")
+                out_parts.append("## 选股理由")
+                out_parts.append("")
+                out_parts.append(reasons)
+                out_parts.append("")
+            out_parts.append("## 每日推荐股分析")
+            out_parts.append("")
+            for code, header_line, block_body in rec_blocks:
+                out_parts.append(header_line)
+                out_parts.append(block_body)
+                out_parts.append("")
+            if footer:
+                out_parts.append(footer)
+            return "\n".join(out_parts)
+
+        return raw_text
 
     def generate_wechat_dashboard(self, results: List[AnalysisResult]) -> str:
         """

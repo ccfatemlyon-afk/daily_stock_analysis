@@ -9,6 +9,7 @@
 import base64
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
@@ -36,38 +37,116 @@ logger = logging.getLogger(__name__)
 # lark-oapi SDK availability
 # ---------------------------------------------------------------------------
 
-FEISHU_SDK_AVAILABLE = False
+FEISHU_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 _lark: Any = None  # type: ignore[assignment]
 FEISHU_DOMAIN = "feishu"
 LARK_DOMAIN = "lark"
-try:
-    import lark_oapi as _lark
-    from lark_oapi.api.im.v1 import (
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-    )
-    from lark_oapi.core.const import FEISHU_DOMAIN as _SDK_FEISHU_DOMAIN
-    from lark_oapi.core.const import LARK_DOMAIN as _SDK_LARK_DOMAIN
 
-    FEISHU_DOMAIN = _SDK_FEISHU_DOMAIN
-    LARK_DOMAIN = _SDK_LARK_DOMAIN
-    FEISHU_SDK_AVAILABLE = True
-except ImportError:
-    pass
-
-# File-upload SDK classes (isolated from the core messaging SDK availability
-# so that an older lark-oapi without file support doesn't break App Bot text).
+# File-upload SDK availability flag (isolated from the core messaging SDK
+# availability so that an older lark-oapi without file support doesn't break
+# App Bot text). The file-upload classes themselves are resolved lazily via the
+# module ``__getattr__`` below, exactly like the core messaging classes.
 FEISHU_FILE_SDK_AVAILABLE = False
-_CreateFileRequest: Any = None
-_CreateFileRequestBody: Any = None
-try:
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest as _CreateFileRequest,
-        CreateFileRequestBody as _CreateFileRequestBody,
-    )
-    FEISHU_FILE_SDK_AVAILABLE = True
-except ImportError:
-    pass
+
+# The SDK classes (``CreateMessageRequest`` etc.) and the whole ``lark_oapi``
+# package are imported LAZILY on first use. Importing ``lark_oapi`` eagerly pulls
+# in its entire generated API surface, which costs ~20-30s on a cold interpreter
+# start -- and that cost used to be paid on every notification attempt even when
+# Feishu was not configured at all (e.g. an email-only setup). ``find_spec``
+# above only LOCATES the package; it does not execute it.
+#
+# The four class names below are intentionally NOT defined at module level:
+# they are provided on demand by ``__getattr__`` (PEP 562), which triggers the
+# lazy import the first time any of them is read.
+_SDK_LOADED = False
+
+# Names that ``__getattr__`` is allowed to resolve lazily (see PEP 562 below).
+_LAZY_SDK_NAMES = frozenset({
+    "CreateMessageRequest",
+    "CreateMessageRequestBody",
+    "_CreateFileRequest",
+    "_CreateFileRequestBody",
+})
+
+
+def _load_lark_sdk() -> bool:
+    """Import the lark-oapi SDK on first use. Idempotent and all-or-nothing.
+
+    Returns True when the core messaging SDK is usable. The optional file-upload
+    classes and the domain constants are loaded best-effort, mirroring the
+    original module-level behaviour (an older lark-oapi without file support
+    must not break App Bot text delivery).
+
+    Names are collected into locals first and only committed to module globals
+    once every required import has succeeded, so a partial failure can never
+    leave a half-loaded state behind for later callers.
+    """
+    global _lark, CreateMessageRequest, CreateMessageRequestBody
+    global _CreateFileRequest, _CreateFileRequestBody
+    global FEISHU_FILE_SDK_AVAILABLE, FEISHU_DOMAIN, LARK_DOMAIN, _SDK_LOADED
+
+    if _SDK_LOADED:
+        # ``_lark`` is only ever assigned after a successful core import, so it
+        # is the accurate "core SDK usable" signal (unlike the find_spec probe).
+        return _lark is not None
+    _SDK_LOADED = True
+
+    try:
+        import lark_oapi as lark_module
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest as msg_request,
+            CreateMessageRequestBody as msg_request_body,
+        )
+    except ImportError:
+        return False
+
+    _lark = lark_module
+    CreateMessageRequest = msg_request
+    CreateMessageRequestBody = msg_request_body
+
+    try:
+        from lark_oapi.core.const import FEISHU_DOMAIN as sdk_feishu_domain
+        from lark_oapi.core.const import LARK_DOMAIN as sdk_lark_domain
+
+        FEISHU_DOMAIN = sdk_feishu_domain
+        LARK_DOMAIN = sdk_lark_domain
+    except ImportError:
+        pass
+
+    try:
+        from lark_oapi.api.im.v1 import (
+            CreateFileRequest as file_request,
+            CreateFileRequestBody as file_request_body,
+        )
+
+        _CreateFileRequest = file_request
+        _CreateFileRequestBody = file_request_body
+        FEISHU_FILE_SDK_AVAILABLE = True
+    except ImportError:
+        pass
+
+    return True
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the lazily-loaded SDK classes for attribute access / patching.
+
+    Only the explicit allowlist is handled; every other name raises
+    ``AttributeError`` as usual, so a typo still fails loudly instead of
+    triggering a pointless SDK import. When the SDK is unavailable the name is
+    genuinely absent, so an ``AttributeError`` is raised for it too (rather than
+    leaking a ``KeyError`` from the globals lookup).
+    """
+    if name in _LAZY_SDK_NAMES:
+        _load_lark_sdk()
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}"
+            ) from None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -116,6 +195,9 @@ class FeishuSender:
             )
             self._feishu_receive_id_type = "chat_id"
         # domain_name must be "feishu" or "lark"; anything else defaulted to feishu.
+        # The concrete SDK domain constant (a URL) is only known once the SDK has
+        # been imported, so keep the raw choice here and resolve it lazily in
+        # ``_ensure_app_client`` -- the only consumer of ``self._feishu_domain``.
         raw_domain = (
             getattr(config, "feishu_domain", None) or os.getenv("FEISHU_DOMAIN", "feishu")
         ).strip().lower()
@@ -124,7 +206,7 @@ class FeishuSender:
                 "无效的 FEISHU_DOMAIN=%s，回退为 feishu", raw_domain
             )
             raw_domain = "feishu"
-        self._feishu_domain = FEISHU_DOMAIN if raw_domain == "feishu" else LARK_DOMAIN
+        self._raw_domain = raw_domain
 
         self._app_client: Any = _NO_CLIENT
         self._app_client_lock = threading.Lock()
@@ -188,12 +270,27 @@ class FeishuSender:
         with self._app_client_lock:
             if self._app_client is not _NO_CLIENT:
                 return self._app_client
+            # Cheap import-time probe first: if the package is not even present
+            # on disk, fail closed without paying for an import attempt.
             if not FEISHU_SDK_AVAILABLE:
                 logger.warning(
                     "飞书 App Bot 需要 lark-oapi 库；标准安装请运行: pip install -r requirements.txt"
                 )
                 self._app_client = None
                 return None
+            # First real use of the SDK: pay the (one-off) import cost here. The
+            # availability flag probed at import time is cheap; this is where the
+            # (expensive) import actually happens.
+            if not _load_lark_sdk():
+                logger.warning(
+                    "飞书 App Bot 需要 lark-oapi 库；标准安装请运行: pip install -r requirements.txt"
+                )
+                self._app_client = None
+                return None
+            # The SDK domain constants are only meaningful after the import above.
+            self._feishu_domain = (
+                FEISHU_DOMAIN if self._raw_domain == "feishu" else LARK_DOMAIN
+            )
             if not self._feishu_app_id or not self._feishu_app_secret:
                 missing = []
                 if not self._feishu_app_id:
@@ -287,6 +384,13 @@ class FeishuSender:
         a transient failure.
         """
         if client is None:
+            return False
+
+        # Resolve the SDK classes before building the request (idempotent; a
+        # no-op once the SDK has already been imported). Fail closed when the
+        # SDK is unavailable: the class globals would simply not exist yet.
+        if not _load_lark_sdk():
+            logger.warning("lark-oapi 不可用，跳过 App Bot 发送")
             return False
 
         send_uuid = str(uuid_mod.uuid4())
@@ -445,6 +549,9 @@ class FeishuSender:
 
     def _send_file_via_app_bot(self, path: Path, *, display_name: Optional[str] = None) -> bool:
         """Upload *path* to Feishu via App Bot SDK and send as file message."""
+        # Resolve the SDK lazily before consulting the file-upload availability
+        # flag, which is only accurate once the SDK has actually been imported.
+        _load_lark_sdk()
         if not FEISHU_FILE_SDK_AVAILABLE:
             logger.warning("lark-oapi SDK does not support file upload; upgrade lark-oapi")
             return False

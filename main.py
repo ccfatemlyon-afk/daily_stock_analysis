@@ -63,6 +63,7 @@ if _packaged_import_probe:
     sys.exit(0)
 
 import argparse
+import faulthandler
 import logging
 import sys
 import time
@@ -82,6 +83,43 @@ logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
 _PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 _LAST_ANALYSIS_FAILURE_REASON: Optional[str] = None
+#: 整轮跳过（非交易日 / Futu 无持仓）的原因，供哨兵携带；与 _LAST_ANALYSIS_FAILURE_REASON 同构。
+_LAST_ANALYSIS_SKIP_REASON: Optional[str] = None
+
+
+def _emit_dsa_result(outcome: str, **fields) -> None:
+    """把本轮运行的机器可读结论**原子**写入 `DSA_RESULT_PATH`（opt-in 哨兵）。
+
+    **纯增量保证**：第一行即 `if not os.getenv("DSA_RESULT_PATH"): return` ——
+    未设该环境变量时（含**未打补丁的旧 vendor**）立即返回，**零行为变化**。
+    编排层（`stock_pipeline/dsa_runner.py`）经环境变量注入路径，优先读此哨兵、
+    读不到再回退中文日志文本解析（`contract_fallback`）。
+
+    落点固定在 `run_dir/dsa_result.json`（与 `dsa.log` 同级）：`run_dir` 每 run 唯一
+    （`artifacts/runs/<run_id>/`），可避免 DSA 自身持久共享的 `reports/` 目录里残留
+    哨兵被后续 run 误读。
+
+    写盘失败一律吞掉 —— 写哨兵绝不能改变退出码或其它行为。
+    """
+    if not os.getenv("DSA_RESULT_PATH"):
+        return
+    payload: Dict[str, Any] = {
+        "schema": 1,
+        "outcome": outcome,
+        "finished_at": datetime.now().astimezone().isoformat(),
+        "skip_reason": None,
+        "failure_reason": None,
+        "report_saved": None,
+    }
+    payload.update(fields)
+    try:
+        target = Path(os.environ["DSA_RESULT_PATH"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception:
+        pass
 
 
 def _get_active_env_path() -> Path:
@@ -144,6 +182,54 @@ _RUNTIME_ENV_FILE_KEYS = {
 
 # setup_env() already ran at import time above.
 _env_bootstrapped = True
+
+# 会自带事件循环（uvicorn 在后台线程里跑）的运行模式：这些模式**不改**事件循环策略。
+_WEB_MODE_FLAGS = frozenset({"--webui", "--webui-only", "--serve", "--serve-only"})
+
+
+def _apply_windows_event_loop_policy() -> None:
+    """Windows 上把默认的 Proactor 事件循环换成 Selector，绕开非主线程建环崩溃。
+
+    背景（2026-09-14 线上崩溃复盘）
+    ------------------------------
+    litellm 在**流式响应结束**时会在线程池工作线程里执行
+    `asyncio.run(async_success_handler(...))`
+    （`litellm/litellm_core_utils/streaming_handler.py:1771`；仅当调用方未显式调用
+    `response.set_logging_event_loop(...)` 时才走这个 else 分支 —— 本项目直接调
+    `litellm.completion()`，所以必然命中）。
+
+    在 Windows 上 `asyncio.run` 按默认策略新建 **ProactorEventLoop**；该对象在
+    **非主线程**中构造会触发原生崩溃 `0xC0000005`（访问违例，faulthandler 栈顶即
+    `asyncio/windows_events.py` → `asyncio/proactor_events.py` → `logging`）。这是
+    Python 层无法捕获的崩溃，实测导致 2026-09-14 的 daily run 在跑满 644s 后
+    整进程消失：无报告、无日报，退出码 `3221225477`。
+
+    为什么 Selector 是安全的
+    ------------------------
+    Selector 事件循环不做 proactor 的自管道 / IO 完成端口那套初始化，可绕开该崩溃
+    路径。Windows 上 Selector 相对 Proactor **唯一**缺少的能力是 asyncio 子进程
+    （`asyncio.create_subprocess_*`），而本项目全仓不使用（DSA 与 stock_pipeline
+    都走同步 `subprocess`）。因此换策略无功能损失。
+
+    适用范围
+    --------
+    - 仅在 Windows 且**非** WebUI/API 模式下生效（uvicorn 自带事件循环，不动它）。
+    - 只在 `__main__` 入口调用，不影响任何 import 本模块的消费者。
+    """
+    if sys.platform != "win32":
+        return
+    for raw in sys.argv[1:]:
+        if raw.split("=", 1)[0] in _WEB_MODE_FLAGS:
+            return
+    import asyncio
+
+    policy_cls = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_cls is None:  # 3.16+ 移除后静默跳过（届时用 Runner(loop_factory=...)）
+        return
+    try:
+        asyncio.set_event_loop_policy(policy_cls())
+    except Exception:  # pragma: no cover - 策略设置失败不应阻断主流程
+        pass
 
 
 def _bootstrap_environment() -> None:
@@ -751,8 +837,9 @@ def run_full_analysis(
     from src.core.market_review import run_market_review
     from src.core.pipeline import StockAnalysisPipeline
 
-    global _LAST_ANALYSIS_FAILURE_REASON
+    global _LAST_ANALYSIS_FAILURE_REASON, _LAST_ANALYSIS_SKIP_REASON
     _LAST_ANALYSIS_FAILURE_REASON = None
+    _LAST_ANALYSIS_SKIP_REASON = None
 
     def _return_with_auto_backtest(result: bool) -> bool:
         _run_auto_backtest(config)
@@ -793,11 +880,13 @@ def run_full_analysis(
                     "真实账户中无符合条件的 Futu 持仓，"
                     "本轮无需执行个股分析或大盘复盘，跳过执行。"
                 )
+                _LAST_ANALYSIS_SKIP_REASON = "futu_empty"
             else:
                 logger.info(
                     "今日所有相关市场均为非交易日，跳过执行。"
                     "可使用 --force-run 强制执行。"
                 )
+                _LAST_ANALYSIS_SKIP_REASON = "non_trading_day"
             return True
         if set(filtered_codes) != set(effective_codes):
             skipped = set(effective_codes) - set(filtered_codes)
@@ -1426,6 +1515,7 @@ def main() -> int:
         config = get_config()
     except Exception as exc:
         logger.exception("加载配置失败: %s", exc)
+        _emit_dsa_result("failed", failure_reason="config_load_failed")
         return 1
 
     # 配置日志（输出到控制台和文件）
@@ -1433,12 +1523,126 @@ def main() -> int:
         _setup_runtime_logging(config.log_dir, debug=args.debug)
     except Exception as exc:
         logger.exception("切换到配置日志目录失败: %s", exc)
+        _emit_dsa_result("failed", failure_reason="logging_setup_failed")
         return 1
 
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
+
+    # Hang 诊断：teardown 卡死时自动打出全线程栈；记录进程标识用于孪生进程审计
+    try:
+        _diag_sec = int(os.getenv("DSA_DIAG_DUMP_SEC", "600"))
+    except (TypeError, ValueError):
+        _diag_sec = 600
+    if _diag_sec > 0:
+        try:
+            faulthandler.dump_traceback_later(_diag_sec, file=sys.stderr)
+        except Exception as exc:
+            logger.warning("faulthandler 启动失败: %s", exc)
+    try:
+        import threading
+
+        logger.info(
+            "进程标识: pid=%s exe=%s argv=%s threads=%d children=%d",
+            os.getpid(),
+            sys.executable,
+            sys.argv,
+            threading.active_count(),
+            len(multiprocessing.active_children()),
+        )
+    except Exception as exc:
+        logger.warning("进程标识记录失败: %s", exc)
+
+    # 单飞守卫：同机已有分析实例在跑则直接退出（防孪生进程重复花钱/卡 teardown）
+    _analysis_lock = Path(__file__).resolve().parent / ".dsa_analysis.lock"
+    try:
+        _fd = os.open(str(_analysis_lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(
+            _fd,
+            f"pid={os.getpid()}\nargs={' '.join(sys.argv[1:])}\nstarted={time.time()}\n".encode(
+                "utf-8", errors="replace"
+            ),
+        )
+        os.close(_fd)
+
+        def _release_analysis_lock(
+            _p: Path = _analysis_lock, _me: int = os.getpid()
+        ) -> None:
+            try:
+                _cur = _p.read_text(encoding="utf-8", errors="replace").splitlines()
+                if _cur and _cur[0].strip() == f"pid={_me}":
+                    _p.unlink()
+            except OSError:
+                pass
+
+        import atexit
+
+        atexit.register(_release_analysis_lock)
+    except FileExistsError:
+        try:
+            _old = _analysis_lock.read_text(encoding="utf-8", errors="replace")
+            _old_pid = next(
+                (
+                    int(x.split("=", 1)[1])
+                    for x in _old.splitlines()
+                    if x.startswith("pid=")
+                ),
+                None,
+            )
+            _alive = False
+            if _old_pid:
+                if os.name == "nt":
+                    import ctypes as _ct
+                    from ctypes import wintypes as _wintypes
+
+                    # ⚠️ 历史坑（2026-09-13 实测）：仅看 OpenProcess 句柄非空会误判——
+                    # 进程已终止但内核对象未回收时仍能拿到非空句柄，残留单飞锁被当成"已在跑"，
+                    # 导致后续每次运行被挡，只能干等 stale_after(2h) 才自愈（整天不干活）。
+                    # 改用读退出码 STILL_ACTIVE(259) 判定，与 stock_pipeline/locking.py::_process_alive 同构。
+                    # 权限掩码 PROCESS_QUERY_LIMITED_INFORMATION(0x1000)|SYNCHRONIZE(0x100000)：
+                    # 既要读退出码又要看信号状态。
+                    _kernel32 = _ct.windll.kernel32
+                    _h = _kernel32.OpenProcess(0x1000 | 0x100000, False, _old_pid)
+                    if not _h:
+                        # 打不开句柄：进程不存在(ERROR_INVALID_PARAMETER=87) 或
+                        # 存在但无权查询(ERROR_ACCESS_DENIED=5)。后者保守判活。
+                        try:
+                            _err = int(_kernel32.GetLastError())
+                        except (AttributeError, OSError):
+                            _err = 0
+                        _alive = _err == 5
+                    else:
+                        try:
+                            _code = _wintypes.DWORD()
+                            if _kernel32.GetExitCodeProcess(_h, _ct.byref(_code)):
+                                _alive = _code.value == 259
+                            else:
+                                _alive = _kernel32.WaitForSingleObject(_h, 0) == 0x102
+                        finally:
+                            _kernel32.CloseHandle(_h)
+                else:
+                    try:
+                        os.kill(_old_pid, 0)
+                        _alive = True
+                    except OSError:
+                        pass
+            _stale = (time.time() - _analysis_lock.stat().st_mtime) > 7200
+            if not _alive or _stale:
+                logger.warning("清理残留分析锁后继续")
+                try:
+                    _analysis_lock.unlink()
+                except OSError:
+                    pass
+            else:
+                logger.warning(
+                    "检测到同机已有分析实例运行 (pid=%s)，本次直接退出", _old_pid
+                )
+                _emit_dsa_result("instance_locked")
+                return 0
+        except OSError as exc:
+            logger.warning("分析锁检查失败，继续运行: %s", exc)
 
     # 验证配置
     warnings = config.validate()
@@ -1703,11 +1907,26 @@ def main() -> int:
                         "empty_stock_list",
                         "report_save_failed",
                     }:
+                        _emit_dsa_result(
+                            "failed", failure_reason=_LAST_ANALYSIS_FAILURE_REASON
+                        )
                         return 1
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 
         logger.info("\n程序执行完成")
+
+        # 哨兵：单次运行（编排层 one-shot）的成功 / 跳过终态。
+        # 跳过时 outcome=skipped（_LAST_ANALYSIS_SKIP_REASON 由 run_full_analysis 设置），
+        # 否则若已有失败原因则 failed，其余为 success。
+        if _LAST_ANALYSIS_SKIP_REASON:
+            _emit_dsa_result("skipped", skip_reason=_LAST_ANALYSIS_SKIP_REASON)
+        elif _LAST_ANALYSIS_FAILURE_REASON:
+            _emit_dsa_result("failed", failure_reason=_LAST_ANALYSIS_FAILURE_REASON)
+        else:
+            _emit_dsa_result(
+                "success", report_saved=not bool(getattr(args, "dry_run", False))
+            )
 
         # 如果启用了服务且是非定时任务模式，保持程序运行
         keep_running = start_serve and not (args.schedule or config.schedule_enabled)
@@ -1723,13 +1942,17 @@ def main() -> int:
 
     except KeyboardInterrupt:
         logger.info("\n用户中断，程序退出")
+        _emit_dsa_result("failed", failure_reason="keyboard_interrupt")
         return 130
 
     except Exception as e:
         logger.exception(f"程序执行失败: {e}")
+        _emit_dsa_result("failed", failure_reason="unhandled_exception")
         return 1
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    # 必须在任何事件循环被创建之前设置（litellm 流式收尾会在工作线程里 asyncio.run）。
+    _apply_windows_event_loop_policy()
     sys.exit(main())

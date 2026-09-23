@@ -1,13 +1,120 @@
 # feishu_doc.py
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import importlib.util
 import logging
 import json
-import lark_oapi as lark
-from lark_oapi.api.docx.v1 import *
 from typing import List, Dict, Any, Optional
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# lark-oapi SDK 惰性加载（P5-14）
+# ---------------------------------------------------------------------------
+# 为什么惰性化：`import lark_oapi` 会拉入整份生成式 API 面，冷启动实测 57–65 秒。
+# 而本模块的唯一调用点 main.py 里 `from src.feishu_doc import FeishuDocManager` 位于
+# 完成路径 try 的**顶部、无条件执行**（既不受 --no-notify 也不受 is_configured()
+# 门禁），因此每一次 DSA 运行（包括我们流水线的 --no-notify 运行）都会实付这笔
+# 冷启动代价。把真正的 import 推迟到首次需要 SDK 时即可消除该开销：未配置 /
+# 未调用时零成本。
+#
+# `find_spec` 只**定位**包、不执行它，因此是廉价的可用性探针；真正的（昂贵）
+# import 发生在 _load_lark_sdk() 首次被调用时。
+FEISHU_DOC_SDK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+
+# SDK 名字不在模块级预先定义：由 _load_lark_sdk() 首次成功导入后写入 globals()，
+# 并由下方 PEP 562 的模块 __getattr__ 对外按需暴露。
+_SDK_LOADED = False
+
+# __getattr__ 允许惰性解析的名字白名单：
+#  * `lark` —— 原先由 `import lark_oapi as lark` 带入，对外可能被引用；
+#  * 其余类名 —— 原先由 `from lark_oapi.api.docx.v1 import *` 带入，本模块内部
+#    实际用到（构建文档 / 构建 Block），一并按需暴露以免破坏属性访问。
+_LAZY_SDK_NAMES = frozenset({
+    "lark",
+    "CreateDocumentRequest",
+    "CreateDocumentRequestBody",
+    "CreateDocumentBlockChildrenRequest",
+    "CreateDocumentBlockChildrenRequestBody",
+    "Block",
+    "Divider",
+    "TextRun",
+    "TextElementStyle",
+    "TextElement",
+    "Text",
+    "TextStyle",
+})
+
+
+def _load_lark_sdk() -> bool:
+    """首次使用时导入 lark-oapi SDK。幂等且全有或全无。
+
+    返回 True 表示 SDK 可用（`lark` 及各 docx 类名已就绪）。所有名字先收集到
+    局部变量，待全部导入成功后再一次性提交到模块 globals()，因此部分失败绝不会
+    留下半加载状态给后续调用者。
+    """
+    global lark, _SDK_LOADED
+    global CreateDocumentRequest, CreateDocumentRequestBody
+    global CreateDocumentBlockChildrenRequest, CreateDocumentBlockChildrenRequestBody
+    global Block, Divider, TextRun, TextElementStyle, TextElement, Text, TextStyle
+
+    if _SDK_LOADED:
+        # `lark` 只在核心导入成功后才被赋值，因此它是比 find_spec 探针更准确的
+        # "SDK 可用" 信号（用 `in globals()` 判定，避免导入失败时触发 NameError）。
+        return "lark" in globals()
+    _SDK_LOADED = True
+
+    try:
+        import lark_oapi as lark_module
+        from lark_oapi.api.docx.v1 import (
+            Block as _block,
+            Divider as _divider,
+            TextRun as _text_run,
+            TextElementStyle as _text_element_style,
+            TextElement as _text_element,
+            Text as _text,
+            TextStyle as _text_style,
+            CreateDocumentRequest as _create_document_request,
+            CreateDocumentRequestBody as _create_document_request_body,
+            CreateDocumentBlockChildrenRequest as _create_document_block_children_request,
+            CreateDocumentBlockChildrenRequestBody as _create_document_block_children_request_body,
+        )
+    except ImportError:
+        return False
+
+    lark = lark_module
+    Block = _block
+    Divider = _divider
+    TextRun = _text_run
+    TextElementStyle = _text_element_style
+    TextElement = _text_element
+    Text = _text
+    TextStyle = _text_style
+    CreateDocumentRequest = _create_document_request
+    CreateDocumentRequestBody = _create_document_request_body
+    CreateDocumentBlockChildrenRequest = _create_document_block_children_request
+    CreateDocumentBlockChildrenRequestBody = _create_document_block_children_request_body
+    return True
+
+
+def __getattr__(name: str) -> Any:
+    """按需解析惰性加载的 SDK 名字（供属性访问 / 打桩使用）。
+
+    只处理显式白名单；其余名字照常抛 AttributeError，因此拼写错误会立刻失败，
+    而不会触发一次毫无意义的 SDK 导入。SDK 不可用时该名字确实不存在，同样抛
+    AttributeError（而不是从 globals 查找里泄漏 KeyError）。
+    """
+    if name in _LAZY_SDK_NAMES:
+        _load_lark_sdk()
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}"
+            ) from None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class FeishuDocManager:
@@ -21,7 +128,8 @@ class FeishuDocManager:
 
         # 初始化 SDK 客户端
         # SDK 会自动处理 tenant_access_token 的获取和刷新，无需人工干预
-        if self.is_configured():
+        # 仅在配置完整时才加载 SDK —— 未配置时连 import 都不触发（省下 57-65s）
+        if self.is_configured() and _load_lark_sdk():
             self.client = lark.Client.builder() \
                 .app_id(self.app_id) \
                 .app_secret(self.app_secret) \
@@ -40,6 +148,12 @@ class FeishuDocManager:
         """
         if not self.client or not self.is_configured():
             logger.warning("飞书 SDK 未初始化或配置缺失，跳过创建")
+            return None
+
+        # 确保 SDK 类名已就绪（幂等；通常 client 非空即代表已加载）。
+        # 首次真正用到 SDK 的路径在此付一次性的 import 成本。
+        if not _load_lark_sdk():
+            logger.warning("lark-oapi 不可用，跳过创建飞书文档")
             return None
 
         try:
@@ -102,6 +216,10 @@ class FeishuDocManager:
         """
         将简单的 Markdown 转换为飞书 SDK 的 Block 对象
         """
+        # 确保 SDK 类名已就绪（幂等）；正常情况下调用方 create_daily_doc 已加载。
+        if not _load_lark_sdk():
+            return []
+
         blocks = []
         lines = md_text.split('\n')
 

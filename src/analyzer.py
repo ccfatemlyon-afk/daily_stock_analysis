@@ -507,6 +507,39 @@ def _is_value_placeholder(v: Any) -> bool:
     return is_chip_placeholder_value(v)
 
 
+#: 数据门维度（P1-1a）：缺失维度不得参与打分，见 `_compute_data_gaps`。
+DATA_GAP_TECHNICAL = "technical"
+DATA_GAP_FUNDAMENTALS = "fundamentals"
+DATA_GAP_NEWS = "news"
+
+
+def _compute_data_gaps(context: Any, news_context: Any) -> list:
+    """机器可读的数据缺口清单（fail-soft：未知结构即视为缺失）。
+
+    - technical：编排层已标记 `context['data_missing']`
+    - fundamentals：结构化财报字段全为 N/A/空（与 prompt 内 N/A 判定同口径）
+    - news：无消息面证据（news_context 为空）
+    """
+    gaps = []
+    try:
+        if isinstance(context, dict) and context.get("data_missing"):
+            gaps.append(DATA_GAP_TECHNICAL)
+    except Exception:
+        gaps.append(DATA_GAP_TECHNICAL)
+    try:
+        fund = (context.get("fundamental_context") or {}) if isinstance(context, dict) else {}
+        earnings = ((fund.get("earnings") or {}).get("data") or {}) if isinstance(fund, dict) else {}
+        report = (earnings.get("financial_report") or {}) if isinstance(earnings, dict) else {}
+        values = [v for v in report.values()] if isinstance(report, dict) else []
+        if not values or all(_is_value_placeholder(v) for v in values):
+            gaps.append(DATA_GAP_FUNDAMENTALS)
+    except Exception:
+        gaps.append(DATA_GAP_FUNDAMENTALS)
+    if not news_context:
+        gaps.append(DATA_GAP_NEWS)
+    return gaps
+
+
 _RISK_WARNING_PLACEHOLDER_TEXTS = {
     "",
     "n/a",
@@ -1737,6 +1770,9 @@ class AnalysisResult:
     # 资讯池，这些同样进入模型输入却不产生搜索命中。只看计数会把这类分析误报成
     # 「未纳入新闻面证据」。
     news_evidence_present: bool = False
+    # 数据门（P1-1a）：机器可读的数据缺口清单，见 `_compute_data_gaps`。
+    # 缺失维度不得参与打分（prompt 内声明），报告详情段首醒目披露。
+    data_gaps: Optional[List[str]] = None
     data_sources: str = ""  # 数据来源说明
     success: bool = True
     error_message: Optional[str] = None
@@ -1791,6 +1827,7 @@ class AnalysisResult:
             'news_result_count': self.news_result_count,
             'news_result_count_known': self.news_result_count_known,
             'news_evidence_present': self.news_evidence_present,
+            'data_gaps': self.data_gaps,
             'success': self.success,
             'error_message': self.error_message,
             'current_price': self.current_price,
@@ -2099,6 +2136,27 @@ class GeminiAnalyzer:
 
 """ + CANONICAL_DECISION_SCALE_PROMPT_ZH + """
 
+## 价值投资研判方法论（四大师视角对抗，借鉴 AI Berkshire 框架）
+
+在形成 `fundamental_analysis`、`company_highlights`、`risk_warning` 与核心结论前，必须内部执行以下研判纪律：
+
+1. **四大师视角对抗**（用于交叉验证，而非四份报告拼接）：
+   - **段永平（生意本质）**：这门生意是否简单可理解？赚钱模式是否清晰可持续？
+   - **巴菲特（财务与估值）**：护城河深浅？当前价格相对内在价值是否有安全边际？关键比率（PE/PB/ROE）如实引用，不心算。
+   - **芒格（逆向思考）**：什么情况下会亏大钱、会死？列出 1-3 个主要失败情景及概率。
+   - **李录（长期确定性）**：10 年后这家公司是否大概率还在且更强？管理层与文化是否可信？
+   当四视角出现真实冲突（如“便宜但不确定”），结论必须反映张力，而非强行统一。
+
+2. **强制给结论，禁止打太极**：不得用“一方面……另一方面……投资有风险”收尾。必须落在明确的 买入/加仓/持有/减仓/卖出/观望，并给出价格区间与分层建议（激进/稳健/保守）。讲不清为什么买 = 不买（镜子测试）。
+
+3. **快速否决清单（任一红线一票否决，不论估值多便宜）**：管理层诚信污点/财务造假；退市或 ST 风险；主业持续恶化；高杠杆且流动性危机；监管重大处罚/问询未落地；大股东/高管持续大额减持；护城河被颠覆性技术瓦解；数据严重缺失无法判断。命中即 `decision_type` 不得为 buy，并在 `risk_warning` 标明否决原因。
+
+4. **信息丰富度与留白原则**：数据有限时，用“灰色地带/不确定性高”如实标注，宁可不给结论也不要用推测伪装确定性；推断指标须标注置信度。
+
+5. **三情景估值**：对目标价给出 乐观/中性/悲观 区间而非单点；单位（元/港元/人民币）如实标注，不混用。
+
+6. **不自算**：所有财务比率、市值、估值均以来源数据为准，禁止心算或臆造精确数字。
+
 ## 输出格式：决策仪表盘 JSON
 
 请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
@@ -2274,7 +2332,15 @@ class GeminiAnalyzer:
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
-- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。
+
+## 输出格式强制要求
+
+- 必须且只能输出一个 JSON 对象，不要任何 markdown 围栏（```json ... ```）
+- 不要在 JSON 前后加任何解释、备注、问候语
+- JSON 必须是字符串最外层包裹，不要 Python dict 字面量
+- 如果数据不足以填充某个字段，用 null，不要编造
+- 最终输出只包含 JSON，不要任何其他文本"""
 
     TEXT_SYSTEM_PROMPT = """你是一位专业的股票分析助手。
 
@@ -4400,8 +4466,21 @@ class GeminiAnalyzer:
 """
         else:
             prompt += """
-未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
+未搜索到该股票近期的相关新闻。**新闻维度直接跳过、不参与打分**：
+不要因为缺新闻就下调评分或写"情绪中性"类兜底判断；把新闻维度的
+权重按比例分给技术面与基本面，只按实际拿到的数据下结论。
 """
+
+        # P1-1a 数据门：缺失维度声明 + 不得参与打分（机器清单见 `_compute_data_gaps`）。
+        _gaps = _compute_data_gaps(context, news_context)
+        if _gaps:
+            _gap_names = {"technical": "技术面", "fundamentals": "基本面", "news": "新闻面"}
+            prompt += (
+                "\n## ⛔ 数据缺口声明\n\n以下维度数据缺失："
+                + "、".join(_gap_names.get(g, g) for g in _gaps)
+                + "\n\n缺失维度**不得参与打分**，不得用其它维度的数据反推、"
+                + "也不得写看似具体的判断；相关结论段直接写“数据缺失，无法判断”。\n"
+            )
 
         # 注入缺失数据警告
         if context.get('data_missing'):
@@ -4716,13 +4795,79 @@ class GeminiAnalyzer:
         if "```" in text:
             raise ValueError("ambiguous_json")
 
+        # No fence: if stripped text starts with {, try direct parse + repair
+        if stripped.startswith("{"):
+            try:
+                data = json.loads(stripped)
+                return stripped, data
+            except json.JSONDecodeError:
+                pass
+            try:
+                repaired = repair_json(stripped)
+                data = json.loads(repaired)
+                return repaired, data
+            except (json.JSONDecodeError, Exception):
+                if self._contains_embedded_json_object(text):
+                    raise ValueError("ambiguous_json")
+                raise
         try:
             data = self._load_analysis_json_candidate(stripped)
         except json.JSONDecodeError as exc:
+            salvaged = self._salvage_largest_json_object(text)
+            if salvaged is not None:
+                return salvaged
             if self._contains_embedded_json_object(text):
                 raise ValueError("ambiguous_json") from exc
             raise
         return stripped, data
+
+    @staticmethod
+    def _salvage_largest_json_object(text: str) -> Tuple[str, Dict[str, Any]] | None:
+        """Recover the largest balanced {...} span from prose-wrapped LLM output.
+
+        Last-resort salvage: returns (json_str, data) or None. Callers still
+        run the minimal-contract check, so a bad salvage can only fall back
+        to the pre-existing failure path, never worse.
+        """
+        best: Optional[str] = None
+        depth = 0
+        start = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text or ""):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        cand = text[start:i + 1]
+                        if best is None or len(cand) > len(best):
+                            best = cand
+        if not best:
+            return None
+        try:
+            data = json.loads(best)
+            return best, data
+        except json.JSONDecodeError:
+            pass
+        try:
+            repaired = repair_json(best)
+            return repaired, json.loads(repaired)
+        except (json.JSONDecodeError, Exception):
+            return None
 
     def _load_analysis_json_candidate(self, json_str: str) -> Dict[str, Any]:
         """Parse one already-selected JSON candidate, repairing common LLM JSON drift."""
@@ -4909,6 +5054,7 @@ class GeminiAnalyzer:
                 buy_reason=data.get('buy_reason', ''),
                 # 元数据
                 search_performed=data.get('search_performed', False),
+                data_gaps=_compute_data_gaps(context, news_context),
                 data_sources=data.get('data_sources', _localized_text(
                     report_language, en='Technical data', zh='技术面数据', ko='기술적 데이터')),
                 success=True,
