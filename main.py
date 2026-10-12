@@ -1531,6 +1531,18 @@ def main() -> int:
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
+    # 原生崩溃留痕（2026-10-12 补）：`dump_traceback_later` 只是"定时转储"看门狗，
+    # **不捕获致命信号** —— 缺 `faulthandler.enable()` 时，`0xC0000005`
+    # （STATUS_ACCESS_VIOLATION）这类原生崩溃在日志里**一行栈都不留**。现网 daily
+    # 首次尝试正是如此：rc=3221225477，`dsa.log` 里只有看门狗的全线程转储、没有
+    # `Windows fatal exception` 字样 ⇒ "崩了但查不出崩在哪"。
+    # ⚠️ **顺序**：`enable()` 必须先于 `dump_traceback_later()`。二者不冲突，但反过来
+    # 写会让"真崩溃"继续静默 —— 那正是要修的一半。
+    try:
+        faulthandler.enable(file=sys.stderr)
+    except Exception as exc:
+        logger.warning("faulthandler.enable 失败: %s", exc)
+
     # Hang 诊断：teardown 卡死时自动打出全线程栈；记录进程标识用于孪生进程审计
     try:
         _diag_sec = int(os.getenv("DSA_DIAG_DUMP_SEC", "600"))

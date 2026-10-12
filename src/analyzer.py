@@ -3986,6 +3986,16 @@ class GeminiAnalyzer:
 
                 # 解析响应
                 result = self._parse_response(response_text, code, name)
+                # 数据门（P1-1a）：`data_gaps` 必须**在这里**算 —— `context` /
+                # `news_context` 是 `analyze()` 的入参，`_parse_response()` 的签名
+                # （`response_text, code, name`）里**没有**它们。
+                # ⚠️ 历史回归（2026-10-12 现网 daily 全灭）：该赋值一度写在
+                # `_parse_response()` 内部 `AnalysisResult(...)` 的构造实参里，于是
+                # 每次成功解析都抛 `NameError: name 'context' is not defined` ——
+                # 异常被本方法下方的 `except Exception` 吞成"单票分析失败"（`success=False`），
+                # 9 只票全灭 ⇒ `results` 空 ⇒ DSA 落 `no_report`（"数据抓完却没报告"）。
+                # 守卫：`tests/test_vendor_analyzer_data_gaps.py`（驱动本方法走成功解析路径）。
+                result.data_gaps = _compute_data_gaps(context, news_context)
                 result.raw_response = response_text
                 result.search_performed = bool(news_context)
                 result.market_snapshot = self._build_market_snapshot(context)
@@ -5054,7 +5064,6 @@ class GeminiAnalyzer:
                 buy_reason=data.get('buy_reason', ''),
                 # 元数据
                 search_performed=data.get('search_performed', False),
-                data_gaps=_compute_data_gaps(context, news_context),
                 data_sources=data.get('data_sources', _localized_text(
                     report_language, en='Technical data', zh='技术面数据', ko='기술적 데이터')),
                 success=True,
