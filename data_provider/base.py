@@ -3416,6 +3416,39 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
+    def _capital_flow_cache_block(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """S-7 补丁（2026-10-27）：**预算耗尽也要读同花顺缓存**。
+
+        为什么必须单独一条路径：`get_fundamental_context` 的 stage 预算（默认 8s）
+        先被 valuation / growth / earnings / institution / dividend / top10 吃掉，
+        轮到 capital_flow 时 `remaining_seconds` 常为 **0** ⇒ 旧实现在 `timeout<=0`
+        直接返回 `failed`，兜底代码根本执行不到（2026-10-27 真机复现：整段 8.02s、
+        `capital_flow status=failed`，19 只票无一例外）。
+
+        读缓存是**本地文件**（毫秒级），不占用也不消耗预算 ⇒ 允许在零预算下执行。
+        返回 `None` 表示没有可用缓存（调用方沿用原 failed 行为）。
+        """
+        try:
+            from .fundamental_adapter import load_ths_fund_flow
+
+            flow, _reason = load_ths_fund_flow(stock_code)
+        except Exception:  # noqa: BLE001 —— 兜底路径绝不因缓存问题抛
+            return None
+        if not isinstance(flow, dict) or not flow:
+            return None
+        return self._build_fundamental_block(
+            "degraded",
+            {
+                "stock_flow": flow,
+                "sector_rankings": {"top": [], "bottom": []},
+                "stock_flow_source": "ths",
+                "stock_flow_degraded": True,
+                "stock_flow_metric": "net_inflow_all_orders",
+            },
+            [{"provider": "ths_cache", "result": "degraded", "duration_ms": 0}],
+            ["eastmoney_budget_exhausted:ths_cache_used"],
+        )
+
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
@@ -3432,6 +3465,9 @@ class DataFetcherManager:
             )
 
         if timeout <= 0:
+            cached = self._capital_flow_cache_block(stock_code)
+            if cached is not None:
+                return cached
             return self._build_fundamental_block(
                 "failed",
                 {},
@@ -3444,6 +3480,9 @@ class DataFetcherManager:
             "capital_flow",
         )
         if not isinstance(payload, dict):
+            cached = self._capital_flow_cache_block(stock_code)
+            if cached is not None:
+                return cached
             return self._build_fundamental_block(
                 "failed",
                 {},

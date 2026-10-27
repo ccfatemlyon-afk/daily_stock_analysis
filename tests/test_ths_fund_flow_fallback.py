@@ -228,5 +228,49 @@ class TestContextStatus(unittest.TestCase):
         self.assertFalse(block["data"]["stock_flow_degraded"])
 
 
+class TestZeroBudgetCacheFallback(unittest.TestCase):
+    """2026-10-27 真机缺陷的回归：stage 预算被前面的阶段吃光 ⇒ capital_flow
+    拿到 `budget_seconds=0`，旧实现在这里直接 `failed`，兜底代码执行不到
+    （实测整段 8.02s、19 只票全部 `status=failed`）。
+
+    读缓存是本地文件（毫秒级），不占预算 ⇒ 零预算下也必须能拿到缓存。
+    """
+
+    _FLOW = {"main_net_inflow": 618000000.0, "inflow_5d": None, "inflow_10d": None}
+
+    def _manager(self):
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            fundamental_fetch_timeout_seconds=8.0,
+            fundamental_retry_max=1,
+        )
+        return manager, cfg
+
+    def test_zero_budget_reads_cache_and_marks_degraded(self) -> None:
+        manager, cfg = self._manager()
+        adapter = SimpleNamespace(
+            get_capital_flow=lambda code: (_ for _ in ()).throw(
+                AssertionError("零预算下不该再走东财（预算已耗尽）"))
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "_fundamental_adapter", adapter), \
+                patch("data_provider.fundamental_adapter.load_ths_fund_flow",
+                      return_value=(dict(self._FLOW), None)):
+            block = manager.get_capital_flow_context("601398", budget_seconds=0)
+        self.assertEqual(block["status"], "degraded", "零预算兜底必须标 degraded，不冒充 ok")
+        self.assertEqual(block["data"]["stock_flow"], self._FLOW)
+        self.assertEqual(block["data"]["stock_flow_source"], "ths")
+        self.assertTrue(block["data"]["stock_flow_degraded"])
+
+    def test_zero_budget_without_cache_stays_failed(self) -> None:
+        manager, cfg = self._manager()
+        with patch("src.config.get_config", return_value=cfg), \
+                patch("data_provider.fundamental_adapter.load_ths_fund_flow",
+                      return_value=(None, "ths_cache_missing:ths_fund_flow_latest.json")):
+            block = manager.get_capital_flow_context("601398", budget_seconds=0)
+        self.assertEqual(block["status"], "failed", "没有缓存时保持原行为（不许伪造数据）")
+        self.assertIn("fundamental stage timeout", block["errors"])
+
+
 if __name__ == "__main__":
     unittest.main()
