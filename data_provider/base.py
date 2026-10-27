@@ -3458,8 +3458,12 @@ class DataFetcherManager:
             has_stock_flow = any(v is not None for v in stock_flow.values())
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
         adapter_status = str(payload.get("status", "not_supported"))
+        stock_flow_source = payload.get("stock_flow_source")
+        stock_flow_degraded = bool(payload.get("stock_flow_degraded"))
         if has_stock_flow or has_sector_rankings:
-            capital_flow_status = "ok"
+            # S-7：兜底源拿到的数不许冒充东财 `ok` —— 明确标 `degraded`，
+            # 并带上 `stock_flow_source` / `stock_flow_metric` 让消费方看得见口径差。
+            capital_flow_status = "degraded" if stock_flow_degraded else "ok"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"
         else:
@@ -3470,6 +3474,9 @@ class DataFetcherManager:
             {
                 "stock_flow": payload.get("stock_flow", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
+                "stock_flow_source": stock_flow_source,
+                "stock_flow_degraded": stock_flow_degraded,
+                "stock_flow_metric": payload.get("stock_flow_metric"),
             },
             self._normalize_source_chain(
                 payload.get("source_chain", []),

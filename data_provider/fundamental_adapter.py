@@ -8,14 +8,84 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# --- S-7：个股资金流兜底（同花顺缓存）----------------------------------------
+#
+# 病根：`get_capital_flow` 只走东财 `push2his`（`stock_individual_fund_flow` 等），
+# 单源无兜底 —— 该族接口自 2026-09-15 起间歇性 `RemoteDisconnected`，DB 逐日实证
+# `stock_flow ok=0` ⇒ analyzer 的 fail-soft 门把所有买入结论降级「持有观察」+ 评分
+# 钳 [45,59]，daily 邮件实质退化成纯技术面。
+#
+# 兜底形态：**同花顺全市场表由编排层每日预热成缓存文件**（`tools/ths_fund_flow_warm.py`），
+# 这里只读文件。不在本函数里现取 —— 那张表 66s / 105 页，而本函数预算只有
+# `fundamental_fetch_timeout_seconds`（默认 8s）。
+THS_CACHE_FILENAME = "ths_fund_flow_latest.json"
+#: 缓存最大年龄：超过就当没有（周末/节假日跑也不至于拿上周的流当今天的）。
+THS_CACHE_MAX_AGE_SEC = 3 * 24 * 3600
+#: 东财逐股候选的**硬预算**（akshare 的 `requests.get` 没超时，单次可能挂 60s）。
+#: 不硬切的话：整个 `get_capital_flow` 会被外层 8s 预算放弃 ⇒ 兜底分支永远跑不到。
+CAPITAL_FLOW_EM_BUDGET_SEC = 2.0
+#: 东财板块排行候选的硬预算（它只影响 `sector_rankings`，不参与买入判定）。
+CAPITAL_FLOW_EM_SECTOR_BUDGET_SEC = 1.0
+
+
+def _ths_cache_path() -> Path:
+    override = os.getenv("THS_FUND_FLOW_CACHE_FILE")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[1] / "data" / "cache" / THS_CACHE_FILENAME
+
+
+def _code6(raw: Any) -> str:
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    return digits.zfill(6)[-6:] if digits else ""
+
+
+def load_ths_fund_flow(stock_code: str, *, now: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """从预热缓存里取该股当日资金流。
+
+    返回 `(flow, reason)`：`flow` 非空时字段与东财路径**同名**
+    （`main_net_inflow` / `inflow_5d` / `inflow_10d`），但缺的窗口显式 `None`；
+    取不到时 `flow=None` 且 `reason` 说明是哪一步（缺失/过期/无该股/坏文件），
+    便于 `errors` 里留痕 —— 不允许静默。
+    """
+    path = _ths_cache_path()
+    if not path.is_file():
+        return None, f"ths_cache_missing:{path.name}"
+    age = (now if now is not None else time.time()) - path.stat().st_mtime
+    if age > THS_CACHE_MAX_AGE_SEC:
+        return None, f"ths_cache_stale:{int(age // 3600)}h"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 —— 兜底路径绝不因缓存坏而抛
+        return None, f"ths_cache_invalid:{type(exc).__name__}"
+    flow_map = payload.get("flow") if isinstance(payload, dict) else None
+    if not isinstance(flow_map, dict):
+        return None, "ths_cache_invalid:no_flow"
+    entry = flow_map.get(_code6(stock_code))
+    if not isinstance(entry, dict):
+        return None, "ths_cache_no_symbol"
+    return (
+        {
+            "main_net_inflow": entry.get("main_net_inflow"),
+            "inflow_5d": entry.get("inflow_5d"),
+            "inflow_10d": entry.get("inflow_10d"),
+        },
+        None,
+    )
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -267,26 +337,58 @@ class AkshareFundamentalAdapter:
     def _call_df_candidates(
         self,
         candidates: List[Tuple[str, Dict[str, Any]]],
+        budget_seconds: Optional[float] = None,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
+        """逐个候选函数试；`budget_seconds` 给定时，整个循环有**硬预算**。
+
+        S-7 的成因就在「没预算」：akshare 的请求**没有 timeout**，`push2his` 单次能
+        挂 60s ⇒ 外层 `_run_with_retry`（默认 8s）把整个 `get_capital_flow` 放弃，
+        后面的兜底分支根本没机会跑。这里每个候选丢进 daemon 线程、`join(budget)`，
+        超时就当这个候选失败继续下一个（卡住的线程自行结束，不阻塞进程退出）。
+        不传预算 ⇒ 与改动前逐字一致（同步直调）。
+        """
         errors: List[str] = []
         try:
             import akshare as ak
         except Exception as exc:
             return None, None, [f"import_akshare:{type(exc).__name__}"]
 
+        deadline = (time.monotonic() + float(budget_seconds)) if budget_seconds else None
+
         for func_name, kwargs in candidates:
             fn = getattr(ak, func_name, None)
             if fn is None:
                 continue
-            try:
-                df = fn(**kwargs)
-                if isinstance(df, pd.Series):
-                    df = df.to_frame().T
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    return df, func_name, errors
-            except Exception as exc:
-                errors.append(f"{func_name}:{type(exc).__name__}")
-                continue
+            if deadline is None:
+                try:
+                    df = fn(**kwargs)
+                except Exception as exc:
+                    errors.append(f"{func_name}:{type(exc).__name__}")
+                    continue
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append(f"{func_name}:budget_exhausted")
+                    continue
+                box: Dict[str, Any] = {}
+
+                def _invoke(_fn=fn, _kwargs=kwargs, _box=box) -> None:
+                    try:
+                        _box["df"] = _fn(**_kwargs)
+                    except Exception as exc:  # noqa: BLE001 —— 原样带回主线程
+                        _box["err"] = f"{type(exc).__name__}"
+
+                worker = threading.Thread(target=_invoke, daemon=True)
+                worker.start()
+                worker.join(remaining)
+                if "df" not in box:
+                    errors.append(f"{func_name}:{box.get('err') or 'timeout'}")
+                    continue
+                df = box["df"]
+            if isinstance(df, pd.Series):
+                df = df.to_frame().T
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, func_name, errors
         return None, None, errors
 
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
@@ -431,7 +533,7 @@ class AkshareFundamentalAdapter:
             ("stock_individual_fund_flow", {}),
             ("stock_main_fund_flow", {"symbol": stock_code}),
             ("stock_main_fund_flow", {}),
-        ])
+        ], budget_seconds=CAPITAL_FLOW_EM_BUDGET_SEC)
         result["errors"].extend(stock_errors)
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)
@@ -449,7 +551,7 @@ class AkshareFundamentalAdapter:
         sector_df, sector_source, sector_errors = self._call_df_candidates([
             ("stock_sector_fund_flow_rank", {}),
             ("stock_sector_fund_flow_summary", {}),
-        ])
+        ], budget_seconds=CAPITAL_FLOW_EM_SECTOR_BUDGET_SEC)
         result["errors"].extend(sector_errors)
         if sector_df is not None:
             name_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("板块", "行业", "名称", "name"))), None)
@@ -465,6 +567,19 @@ class AkshareFundamentalAdapter:
                     "bottom": [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in bottom_df.iterrows()],
                 }
                 result["source_chain"].append(f"capital_sector:{sector_source}")
+
+        # S-7：东财路径没拿到**有效**值（空 dict，或全是 None）⇒ 读同花顺预热缓存。
+        if not any(value is not None for value in (result["stock_flow"] or {}).values()):
+            cached, cache_reason = load_ths_fund_flow(stock_code)
+            if cached is not None:
+                result["stock_flow"] = cached
+                result["stock_flow_source"] = "ths"
+                result["stock_flow_degraded"] = True
+                result["stock_flow_metric"] = "net_inflow_all_orders"
+                result["source_chain"].append("capital_stock:ths_cache")
+                result["errors"].append("eastmoney_unavailable:ths_cache_used")
+            elif cache_reason:
+                result["errors"].append(cache_reason)
 
         has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
         result["status"] = "partial" if has_content else "not_supported"
