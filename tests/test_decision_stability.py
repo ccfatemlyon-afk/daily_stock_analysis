@@ -3,7 +3,12 @@
 
 from types import SimpleNamespace
 
-from src.analyzer import AnalysisResult, _capital_flow_bias, stabilize_decision_with_structure
+from src.analyzer import (
+    AnalysisResult,
+    _capital_flow_bias,
+    _capital_flow_bias_with_status,
+    stabilize_decision_with_structure,
+)
 
 
 def _result(
@@ -340,3 +345,25 @@ def test_refines_hold_pullback_near_support_as_shakeout_watch() -> None:
     assert result.decision_type == "hold"
     assert result.operation_advice == "洗盘观察"
     assert "更适合按洗盘观察处理" in result.risk_warning
+
+
+def test_capital_flow_bias_does_not_infer_inflow_from_windows_alone() -> None:
+    """Z-7：当日主力字段缺失时，5d/10d 单独为正不得判 inflow。
+
+    这条是 2026-11-05 复盘的回归点：窗口为正曾把一条 sell 结论降级成「持有 45」。
+    """
+    context = {"capital_flow": {"data": {"stock_flow": {"inflow_5d": 2_000_000,
+                                                       "inflow_10d": 1_000_000}}}}
+
+    bias, reason = _capital_flow_bias_with_status(context)
+
+    assert bias == "neutral"
+    assert reason == "main_missing_windows_only"
+
+
+def test_capital_flow_bias_reads_the_main_field_and_names_it() -> None:
+    """主字段存在时方向由它决定，reason 里带字段名（不再是一个裸 "ok"）。"""
+    bias, reason = _capital_flow_bias_with_status(_fund_flow(main=1_500_000))
+
+    assert bias == "inflow"
+    assert reason == "ok:main_net_inflow"

@@ -1520,6 +1520,33 @@ class NotificationService(
                         f"### 📊 {labels['data_perspective_heading']}",
                         "",
                     ])
+                    # Z-7：护栏会把 "卖出" 改写成 "持有 45"，而 45 是 [45,59] 钳制的下界；
+                    # 此前报告只给一个数字，读者无法自证是原始分还是钳制结果。资金流判据同理。
+                    score_cal = dashboard.get("decision_score_calibration") or {}
+                    if score_cal.get("adjusted_score") is not None:
+                        raw_score = score_cal.get("raw_score")
+                        adj_score = score_cal.get("adjusted_score")
+                        score_word = labels.get("score_label") or (
+                            "评分" if report_language == "zh" else "Score")
+                        guard = str(score_cal.get("guardrail_reason") or "")
+                        if raw_score is not None and int(raw_score) != int(adj_score):
+                            report_lines.append(
+                                f"**{score_word}**: {raw_score} → {adj_score}"
+                                + (f"（{guard}）" if guard else ""))
+                        else:
+                            report_lines.append(f"**{score_word}**: {adj_score}")
+                        report_lines.append("")
+                    stability = dashboard.get("decision_stability") or {}
+                    if stability.get("capital_flow_bias"):
+                        flow_word = ("资金流判据" if report_language == "zh"
+                                     else "Capital flow basis")
+                        applied_word = ("已应用" if stability.get("applied")
+                                        else "未应用") if report_language == "zh" \
+                            else ("applied" if stability.get("applied") else "not applied")
+                        report_lines.append(
+                            f"**{flow_word}**: {stability.get('capital_flow_bias')}"
+                            f"（{applied_word}）")
+                        report_lines.append("")
                     # 趋势状态
                     if trend_data:
                         is_bullish = (

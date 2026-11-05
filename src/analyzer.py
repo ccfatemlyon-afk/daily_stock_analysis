@@ -1331,24 +1331,25 @@ def _capital_flow_bias_with_status(
             return None
         return "inflow" if value > 0 else "outflow"
 
-    numeric_values = [
-        _coerce_numeric_value(stock_flow.get("main_net_inflow")),
-        _coerce_numeric_value(stock_flow.get("inflow_5d")),
-        _coerce_numeric_value(stock_flow.get("inflow_10d")),
-    ]
-    if all(value is None for value in numeric_values):
+    main_net = _coerce_numeric_value(stock_flow.get("main_net_inflow"))
+    windows = [_coerce_numeric_value(stock_flow.get("inflow_5d")),
+               _coerce_numeric_value(stock_flow.get("inflow_10d"))]
+    if main_net is None and all(value is None for value in windows):
         return "unavailable", "missing_or_na_flow_fields"
 
-    ordered_signals = [
-        _flow_direction(value) for value in numeric_values
-    ]
-    directions = {signal for signal in ordered_signals if signal is not None}
-    if not directions or len(directions) > 1:
+    # Z-7：当日主力净额是**唯一主字段**。5d/10d 是累计窗口，"窗口为正" 证明不了
+    # "今天在买" —— 2026-11-05 复盘里正是三字段任一为正即判 inflow 的组合，把一条
+    # sell 结论改写成 "持有 45"。主字段缺失时不再用窗口推断方向（退回 neutral），
+    # 主字段与窗口冲突时同样中性：两个保守分支都不触发 sell 降级。
+    if main_net is None:
+        return "neutral", "main_missing_windows_only"
+    main_dir = _flow_direction(main_net)
+    if main_dir is None:
+        return "neutral", "neutral"
+    window_dirs = {d for d in (_flow_direction(v) for v in windows) if d is not None}
+    if window_dirs and window_dirs != {main_dir}:
         return "neutral", "conflict_or_missing"
-    for signal in ordered_signals:
-        if signal is not None:
-            return signal, "ok"
-    return "neutral", "neutral"
+    return main_dir, "ok:main_net_inflow"
 
 
 def _capital_flow_status_for_stability(reason: str, language: str) -> str:
