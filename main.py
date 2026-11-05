@@ -232,6 +232,36 @@ def _apply_windows_event_loop_policy() -> None:
         pass
 
 
+def _disable_litellm_streaming_logging() -> None:
+    """关掉 litellm 的流式收尾日志 —— 它是 Windows 原生崩溃的源头。
+
+    背景（2026-11-06 定位，两次 run 的 faulthandler 栈完全一致）
+    ------------------------------------------------------
+    litellm 每收尾一个流式响应，都会在**线程池工作线程**里执行
+    `asyncio.run(async_success_handler(...))`
+    （`litellm/litellm_core_utils/streaming_handler.py:1771`；仅当调用方没给
+    `logging_loop` 时命中 —— 本项目直接调 `litellm.completion()`，所以必然命中）。
+    Windows 上在非主线程新建事件环会在自管道（`socket.socketpair()`）处触发
+    `0xC0000005` 访问违例：Python 层抓不住，**整进程消失**（实测 636s 崩、
+    23 只全 incomplete、无报告）。P1-15 换 Selector 策略只消掉了 proactor 那套栈，
+    崩溃点仍在，故这里把该路径整条关掉。
+
+    为什么不损失记账
+    -----------------
+    本仓库**不用** litellm 的 success callback / CustomLogger（`src/` 全仓 0 引用），
+    token 用量由 DSA 自己从响应对象取（`src/analyzer.py::_normalize_usage` →
+    `persist_llm_usage`）。这个开关只短路 litellm 自身的异步记账与内部缓存。
+
+    失败时只告警不阻断：这是稳定性优化项，不该让主流程起不来。
+    """
+    try:
+        import litellm
+
+        litellm.disable_streaming_logging = True
+    except Exception as exc:  # pragma: no cover - 依赖缺失不应阻断主流程
+        logger.warning("关闭 litellm 流式收尾日志失败: %s", exc)
+
+
 def _bootstrap_environment() -> None:
     """Load .env and apply optional local proxy settings.
 
@@ -1967,4 +1997,6 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     # 必须在任何事件循环被创建之前设置（litellm 流式收尾会在工作线程里 asyncio.run）。
     _apply_windows_event_loop_policy()
+    # 必须在任何流式 LLM 调用之前设置（litellm 每收尾一个流就在工作线程里新建事件环）。
+    _disable_litellm_streaming_logging()
     sys.exit(main())
