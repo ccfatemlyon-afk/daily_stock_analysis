@@ -1551,6 +1551,20 @@ def _downgrade_to_structural_hold(
     )
 
 
+#: 「结论与资金流冲突」的降级原因键 —— 这四个分支的共同特征是：**方向本身没变**
+#: （看多/看空仍成立），只是"今天不宜动"。以前只改 `operation_advice` 与评分，
+#: `trend_prediction` 保留 LLM 原话 ⇒ 摘要行出现「持有 | 45 | 强烈看空」这种
+#: 自相矛盾的组合（2026-11-22 实盘：江西铜业 600362）。方向必须一并中性化。
+_CONFLICT_REASON_KEYS = frozenset({
+    "buy_near_resistance",
+    "buy_with_outflow",
+    "sell_near_support",
+    "sell_with_inflow",
+})
+#: 中性方向措辞（与 `advice_key == "range"` 的原措辞一致，下游本地化表里有这一档）。
+_NEUTRAL_TREND = {"zh": "震荡", "en": "Sideways", "ko": "횡보"}
+
+
 def _set_structural_hold_wording(
     result: "AnalysisResult",
     language: str,
@@ -1613,13 +1627,11 @@ def _set_structural_hold_wording(
         final_action = "watch" if advice_key in {"range", "shakeout"} else "hold"
         _bound_hold_watch_sentiment_score(result, reason=reason, final_action=final_action)
     result.operation_advice = advice
-    if advice_key == "range":
-        if language == "zh" and "震荡" not in str(result.trend_prediction):
-            result.trend_prediction = "震荡"
-        elif language == "en":
-            result.trend_prediction = "Sideways"
-        elif language == "ko":
-            result.trend_prediction = "횡보"
+    # 方向要么是「区间/洗盘」（本来就该写成震荡），要么是**结论与资金流冲突**
+    # （方向仍属原判断，但已不可执行）—— 两种情形都不能再展示原方向。
+    if advice_key == "range" or reason_key in _CONFLICT_REASON_KEYS:
+        if not (language == "zh" and "震荡" in str(result.trend_prediction)):
+            result.trend_prediction = _NEUTRAL_TREND.get(language, _NEUTRAL_TREND["en"])
 
     if language == "zh":
         no_position = "空仓先不追涨杀跌，等待支撑确认、放量突破或资金回流后再行动。"
